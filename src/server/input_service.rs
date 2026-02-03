@@ -1,9 +1,9 @@
 #[cfg(target_os = "linux")]
 use super::rdp_input::client::{RdpInputKeyboard, RdpInputMouse};
 use super::*;
-#[cfg(target_os = "macos")]
-use crate::common::is_server;
 use crate::input::*;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::whiteboard;
 #[cfg(target_os = "macos")]
 use dispatch::Queue;
 use enigo::{Enigo, Key, KeyboardControllable, MouseButton, MouseControllable};
@@ -17,13 +17,16 @@ use rdev::{self, EventType, Key as RdevKey, KeyCode, RawKey};
 use rdev::{CGEventSourceStateID, CGEventTapLocation, VirtualInput};
 #[cfg(target_os = "linux")]
 use scrap::wayland::pipewire::RDP_SESSION_INFO;
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
 use std::{
     convert::TryFrom,
-    ops::{Deref, DerefMut, Sub},
+    ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{self, Duration, Instant},
 };
+
 #[cfg(windows)]
 use winapi::um::winuser::WHEEL_DELTA;
 
@@ -204,6 +207,7 @@ impl LockModesHandler {
         }
 
         let mut num_lock_changed = false;
+        #[allow(unused)]
         let mut event_num_enabled = false;
         if is_numpad_key {
             let local_num_enabled = en.get_key_state(enigo::Key::NumLock);
@@ -444,7 +448,36 @@ lazy_static::lazy_static! {
     static ref KEYS_DOWN: Arc<Mutex<HashMap<KeysDown, Instant>>> = Default::default();
     static ref LATEST_PEER_INPUT_CURSOR: Arc<Mutex<Input>> = Default::default();
     static ref LATEST_SYS_CURSOR_POS: Arc<Mutex<(Option<Instant>, (i32, i32))>> = Arc::new(Mutex::new((None, (INVALID_CURSOR_POS, INVALID_CURSOR_POS))));
+    // Track connections that are currently using relative mouse movement.
+    // Used to disable whiteboard/cursor display for all events while in relative mode.
+    static ref RELATIVE_MOUSE_CONNS: Arc<Mutex<std::collections::HashSet<i32>>> = Default::default();
 }
+
+#[inline]
+fn set_relative_mouse_active(conn: i32, active: bool) {
+    let mut lock = RELATIVE_MOUSE_CONNS.lock().unwrap();
+    if active {
+        lock.insert(conn);
+    } else {
+        lock.remove(&conn);
+    }
+}
+
+#[inline]
+fn is_relative_mouse_active(conn: i32) -> bool {
+    RELATIVE_MOUSE_CONNS.lock().unwrap().contains(&conn)
+}
+
+/// Clears the relative mouse mode state for a connection.
+///
+/// This must be called when an authenticated connection is dropped (during connection teardown)
+/// to avoid leaking the connection id in `RELATIVE_MOUSE_CONNS` (a `Mutex<HashSet<i32>>`).
+/// Callers are responsible for invoking this on disconnect.
+#[inline]
+pub(crate) fn clear_relative_mouse_active(conn: i32) {
+    set_relative_mouse_active(conn, false);
+}
+
 static EXITING: AtomicBool = AtomicBool::new(false);
 
 const MOUSE_MOVE_PROTECTION_TIMEOUT: Duration = Duration::from_millis(1_000);
@@ -457,7 +490,7 @@ static RECORD_CURSOR_POS_RUNNING: AtomicBool = AtomicBool::new(false);
 // We need to do some special handling for macOS when using the legacy mode.
 #[cfg(target_os = "macos")]
 static LAST_KEY_LEGACY_MODE: AtomicBool = AtomicBool::new(true);
-// We use enigo to 
+// We use enigo to
 // 1. Simulate mouse events
 // 2. Simulate the legacy mode key events
 // 3. Simulate the functioin key events, like LockScreen
@@ -501,8 +534,13 @@ pub fn try_start_record_cursor_pos() -> Option<thread::JoinHandle<()>> {
 }
 
 pub fn try_stop_record_cursor_pos() {
-    let count_lock = CONN_COUNT.lock().unwrap();
-    if *count_lock > 0 {
+    let remote_count = AUTHED_CONNS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.conn_type == AuthConnType::Remote)
+        .count();
+    if remote_count > 0 {
         return;
     }
     RECORD_CURSOR_POS_RUNNING.store(false, Ordering::SeqCst);
@@ -636,8 +674,8 @@ async fn set_uinput_resolution(minx: i32, maxx: i32, miny: i32, maxy: i32) -> Re
 
 pub fn is_left_up(evt: &MouseEvent) -> bool {
     let buttons = evt.mask >> 3;
-    let evt_type = evt.mask & 0x7;
-    return buttons == 1 && evt_type == 2;
+    let evt_type = evt.mask & MOUSE_TYPE_MASK;
+    buttons == MOUSE_BUTTON_LEFT && evt_type == MOUSE_TYPE_UP
 }
 
 #[cfg(windows)]
@@ -659,10 +697,20 @@ fn is_pressed(key: &Key, en: &mut Enigo) -> bool {
     get_modifier_state(key.clone(), en)
 }
 
+// Sleep for 8ms is enough in my tests, but we sleep 12ms to be safe.
+// sleep 12ms In my test, the characters are already output in real time.
 #[inline]
 #[cfg(target_os = "macos")]
 fn key_sleep() {
-    std::thread::sleep(Duration::from_millis(20));
+    // https://www.reddit.com/r/rustdesk/comments/1kn1w5x/typing_lags_when_connecting_to_macos_clients/
+    //
+    // There's a strange bug when running by `launchctl load -w /Library/LaunchAgents/abc.plist`
+    // `std::thread::sleep(Duration::from_millis(20));` may sleep 90ms or more.
+    // Though `/Applications/RustDesk.app/Contents/MacOS/rustdesk --server` in terminal is ok.
+    let now = Instant::now();
+    while now.elapsed() < Duration::from_millis(12) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[inline]
@@ -684,24 +732,33 @@ fn get_modifier_state(key: Key, en: &mut Enigo) -> bool {
     }
 }
 
-pub fn handle_mouse(evt: &MouseEvent, conn: i32) {
+#[allow(unreachable_code)]
+pub fn handle_mouse(
+    evt: &MouseEvent,
+    conn: i32,
+    username: String,
+    argb: u32,
+    simulate: bool,
+    show_cursor: bool,
+) {
     #[cfg(target_os = "macos")]
-    if !is_server() {
-        // having GUI, run main GUI thread, otherwise crash
+    {
+        // having GUI (--server has tray, it is GUI too), run main GUI thread, otherwise crash
         let evt = evt.clone();
-        QUEUE.exec_async(move || handle_mouse_(&evt, conn));
+        QUEUE.exec_async(move || handle_mouse_(&evt, conn, username, argb, simulate, show_cursor));
         return;
     }
     #[cfg(windows)]
-    crate::portable_service::client::handle_mouse(evt, conn);
+    crate::portable_service::client::handle_mouse(evt, conn, username, argb, simulate, show_cursor);
     #[cfg(not(windows))]
-    handle_mouse_(evt, conn);
+    handle_mouse_(evt, conn, username, argb, simulate, show_cursor);
 }
 
 // to-do: merge handle_mouse and handle_pointer
+#[allow(unreachable_code)]
 pub fn handle_pointer(evt: &PointerDeviceEvent, conn: i32) {
     #[cfg(target_os = "macos")]
-    if !is_server() {
+    {
         // having GUI, run main GUI thread, otherwise crash
         let evt = evt.clone();
         QUEUE.exec_async(move || handle_pointer_(&evt, conn));
@@ -879,7 +936,7 @@ fn get_last_input_cursor_pos() -> (i32, i32) {
 }
 
 // check if mouse is moved by the controlled side user to make controlled side has higher mouse priority than remote.
-fn active_mouse_(conn: i32) -> bool {
+fn active_mouse_(_conn: i32) -> bool {
     true
     /* this method is buggy (not working on macOS, making fast moving mouse event discarded here) and added latency (this is blocking way, must do in async way), so we disable it for now
     // out of time protection
@@ -964,7 +1021,32 @@ pub fn handle_pointer_(evt: &PointerDeviceEvent, conn: i32) {
     }
 }
 
-pub fn handle_mouse_(evt: &MouseEvent, conn: i32) {
+pub fn handle_mouse_(
+    evt: &MouseEvent,
+    conn: i32,
+    _username: String,
+    _argb: u32,
+    simulate: bool,
+    _show_cursor: bool,
+) {
+    if simulate {
+        handle_mouse_simulation_(evt, conn);
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let evt_type = evt.mask & MOUSE_TYPE_MASK;
+        // Relative (delta) mouse events do not include absolute coordinates, so
+        // whiteboard/cursor rendering must be disabled during relative mode to prevent
+        // incorrect cursor/whiteboard updates. We check both is_relative_mouse_active(conn)
+        // (connection already in relative mode from prior events) and evt_type (current
+        // event is relative) to guard against the first relative event before the flag is set.
+        if _show_cursor && !is_relative_mouse_active(conn) && evt_type != MOUSE_TYPE_MOVE_RELATIVE {
+            handle_mouse_show_cursor_(evt, conn, _username, _argb);
+        }
+    }
+}
+
+pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     if !active_mouse_(conn) {
         return;
     }
@@ -976,7 +1058,7 @@ pub fn handle_mouse_(evt: &MouseEvent, conn: i32) {
     #[cfg(windows)]
     crate::platform::windows::try_change_desktop();
     let buttons = evt.mask >> 3;
-    let evt_type = evt.mask & 0x7;
+    let evt_type = evt.mask & MOUSE_TYPE_MASK;
     let mut en = ENIGO.lock().unwrap();
     #[cfg(target_os = "macos")]
     en.set_ignore_flags(enigo_ignore_flags());
@@ -1004,6 +1086,8 @@ pub fn handle_mouse_(evt: &MouseEvent, conn: i32) {
     }
     match evt_type {
         MOUSE_TYPE_MOVE => {
+            // Switching back to absolute movement implicitly disables relative mouse mode.
+            set_relative_mouse_active(conn, false);
             en.mouse_move_to(evt.x, evt.y);
             *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
                 conn,
@@ -1011,6 +1095,28 @@ pub fn handle_mouse_(evt: &MouseEvent, conn: i32) {
                 x: evt.x,
                 y: evt.y,
             };
+        }
+        // MOUSE_TYPE_MOVE_RELATIVE: Relative mouse movement for gaming/3D applications.
+        // Each client independently decides whether to use relative mode.
+        // Multiple clients can mix absolute and relative movements without conflict,
+        // as the server simply applies the delta to the current cursor position.
+        MOUSE_TYPE_MOVE_RELATIVE => {
+            set_relative_mouse_active(conn, true);
+            // Clamp delta to prevent extreme/malicious values from reaching OS APIs.
+            // This matches the Flutter client's kMaxRelativeMouseDelta constant.
+            const MAX_RELATIVE_MOUSE_DELTA: i32 = 10000;
+            let dx = evt.x.clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA);
+            let dy = evt.y.clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA);
+            en.mouse_move_relative(dx, dy);
+            // Get actual cursor position after relative movement for tracking
+            if let Some((x, y)) = crate::get_cursor_pos() {
+                *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
+                    conn,
+                    time: get_time(),
+                    x,
+                    y,
+                };
+            }
         }
         MOUSE_TYPE_DOWN => match buttons {
             MOUSE_BUTTON_LEFT => {
@@ -1107,6 +1213,52 @@ pub fn handle_mouse_(evt: &MouseEvent, conn: i32) {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn handle_mouse_show_cursor_(evt: &MouseEvent, conn: i32, username: String, argb: u32) {
+    let buttons = evt.mask >> 3;
+    let evt_type = evt.mask & MOUSE_TYPE_MASK;
+    match evt_type {
+        MOUSE_TYPE_MOVE => {
+            whiteboard::update_whiteboard(
+                whiteboard::get_key_cursor(conn),
+                whiteboard::CustomEvent::Cursor(whiteboard::Cursor {
+                    x: evt.x as _,
+                    y: evt.y as _,
+                    argb,
+                    btns: 0,
+                    text: username,
+                }),
+            );
+        }
+        MOUSE_TYPE_UP => {
+            if buttons == MOUSE_BUTTON_LEFT {
+                // Some clients intentionally send button events without coordinates.
+                // Fall back to the last known cursor position to avoid jumping to (0, 0).
+                // TODO(protocol): (0, 0) is a valid screen coordinate. Consider using a dedicated
+                // sentinel value (e.g. INVALID_CURSOR_POS) or a protocol-level flag to distinguish
+                // "coordinates not provided" from "coordinates are (0, 0)". Impact is minor since
+                // this only affects whiteboard rendering and clicking exactly at (0, 0) is rare.
+                let (x, y) = if evt.x == 0 && evt.y == 0 {
+                    get_last_input_cursor_pos()
+                } else {
+                    (evt.x, evt.y)
+                };
+                whiteboard::update_whiteboard(
+                    whiteboard::get_key_cursor(conn),
+                    whiteboard::CustomEvent::Cursor(whiteboard::Cursor {
+                        x: x as _,
+                        y: y as _,
+                        argb,
+                        btns: buttons,
+                        text: username,
+                    }),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn handle_scale(scale: i32) {
     let mut en = ENIGO.lock().unwrap();
@@ -1186,6 +1338,13 @@ pub fn handle_key(evt: &KeyEvent) {
     // having GUI, run main GUI thread, otherwise crash
     let evt = evt.clone();
     QUEUE.exec_async(move || handle_key_(&evt));
+    // Key sleep is required for macOS.
+    // If we don't sleep, the key press/release events may not take effect.
+    //
+    // For example, the controlled side osx `12.7.6` or `15.1.1`
+    // If we input characters quickly and continuously, and press or release "Shift" for a short period of time,
+    // it is possible that after releasing "Shift", the controlled side will still print uppercase characters.
+    // Though it is not very easy to reproduce.
     key_sleep();
 }
 
@@ -1200,11 +1359,7 @@ fn reset_input() {
 
 #[cfg(target_os = "macos")]
 pub fn reset_input_ondisconn() {
-    if !is_server() {
-        QUEUE.exec_async(reset_input);
-    } else {
-        reset_input();
-    }
+    QUEUE.exec_async(reset_input);
 }
 
 fn sim_rdev_rawkey_position(code: KeyCode, keydown: bool) {
@@ -1246,7 +1401,7 @@ fn sim_rdev_rawkey_virtual(code: u32, keydown: bool) {
 fn simulate_(event_type: &EventType) {
     unsafe {
         let _lock = VIRTUAL_INPUT_MTX.lock();
-        if let Some(input) = &VIRTUAL_INPUT_STATE {
+        if let Some(input) = VIRTUAL_INPUT_STATE.as_ref() {
             let _ = input.simulate(&event_type);
         }
     }
@@ -1258,7 +1413,7 @@ fn press_capslock() {
     let caps_key = RdevKey::RawKey(rdev::RawKey::MacVirtualKeycode(rdev::kVK_CapsLock));
     unsafe {
         let _lock = VIRTUAL_INPUT_MTX.lock();
-        if let Some(input) = &mut VIRTUAL_INPUT_STATE {
+        if let Some(input) = VIRTUAL_INPUT_STATE.as_mut() {
             if input.simulate(&EventType::KeyPress(caps_key)).is_ok() {
                 input.capslock_down = true;
                 key_sleep();
@@ -1273,7 +1428,7 @@ fn release_capslock() {
     let caps_key = RdevKey::RawKey(rdev::RawKey::MacVirtualKeycode(rdev::kVK_CapsLock));
     unsafe {
         let _lock = VIRTUAL_INPUT_MTX.lock();
-        if let Some(input) = &mut VIRTUAL_INPUT_STATE {
+        if let Some(input) = VIRTUAL_INPUT_STATE.as_mut() {
             if input.simulate(&EventType::KeyRelease(caps_key)).is_ok() {
                 input.capslock_down = false;
                 key_sleep();
@@ -1752,6 +1907,51 @@ pub fn wayland_use_uinput() -> bool {
 #[cfg(target_os = "linux")]
 pub fn wayland_use_rdp_input() -> bool {
     !crate::platform::is_x11() && !crate::is_server()
+}
+
+#[cfg(target_os = "linux")]
+pub struct TemporaryMouseMoveHandle {
+    thread_handle: Option<std::thread::JoinHandle<()>>,
+    tx: Option<mpsc::Sender<(i32, i32)>>,
+}
+
+#[cfg(target_os = "linux")]
+impl TemporaryMouseMoveHandle {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<(i32, i32)>();
+        let thread_handle = std::thread::spawn(move || {
+            log::debug!("TemporaryMouseMoveHandle thread started");
+            for (x, y) in rx {
+                ENIGO.lock().unwrap().mouse_move_to(x, y);
+            }
+            log::debug!("TemporaryMouseMoveHandle thread exiting");
+        });
+        TemporaryMouseMoveHandle {
+            thread_handle: Some(thread_handle),
+            tx: Some(tx),
+        }
+    }
+
+    pub fn move_mouse_to(&self, x: i32, y: i32) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send((x, y));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TemporaryMouseMoveHandle {
+    fn drop(&mut self) {
+        log::debug!("Dropping TemporaryMouseMoveHandle");
+        // Close the channel to signal the thread to exit.
+        self.tx.take();
+        // Wait for the thread to finish.
+        if let Some(thread_handle) = self.thread_handle.take() {
+            if let Err(e) = thread_handle.join() {
+                log::error!("Error joining TemporaryMouseMoveHandle thread: {:?}", e);
+            }
+        }
+    }
 }
 
 lazy_static::lazy_static! {

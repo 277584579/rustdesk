@@ -1,16 +1,15 @@
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::keyboard::input_source::{change_input_source, get_cur_session_input_source};
+#[cfg(target_os = "linux")]
+use crate::platform::linux::is_x11;
 use crate::{
     client::file_trait::FileManager,
-    common::make_fd_to_json,
+    common::{make_fd_to_json, make_vec_fd_to_json},
     flutter::{
         self, session_add, session_add_existed, session_start_, sessions, try_sync_peer_option,
     },
     input::*,
     ui_interface::{self, *},
-};
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::{
-    common::get_default_sound_input,
-    keyboard::input_source::{change_input_source, get_cur_session_input_source},
 };
 use flutter_rust_bridge::{StreamSink, SyncReturn};
 #[cfg(feature = "plugin_framework")]
@@ -24,11 +23,12 @@ use hbb_common::{
 };
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         atomic::{AtomicI32, Ordering},
         Arc,
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 pub type SessionID = uuid::Uuid;
@@ -39,7 +39,11 @@ lazy_static::lazy_static! {
 
 fn initialize(app_dir: &str, custom_client_config: &str) {
     flutter::async_tasks::start_flutter_async_runner();
-    *config::APP_DIR.write().unwrap() = app_dir.to_owned();
+    // `APP_DIR` is set in `main_get_data_dir_ios()` on iOS.
+    #[cfg(not(target_os = "ios"))]
+    {
+        *config::APP_DIR.write().unwrap() = app_dir.to_owned();
+    }
     // core_main's load_custom_client does not work for flutter since it is only applied to its load_library in main.c
     if custom_client_config.is_empty() {
         crate::load_custom_client();
@@ -66,6 +70,11 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
     {
         use hbb_common::env_logger::*;
         init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "debug"));
+        crate::common::test_nat_type();
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = crate::common::global_init();
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -95,16 +104,30 @@ pub fn host_stop_system_key_propagate(_stopped: bool) {
 }
 
 // This function is only used to count the number of control sessions.
-pub fn peer_get_default_sessions_count(id: String) -> SyncReturn<usize> {
-    SyncReturn(sessions::get_session_count(id, ConnType::DEFAULT_CONN))
+pub fn peer_get_sessions_count(id: String, conn_type: i32) -> SyncReturn<usize> {
+    let conn_type = if conn_type == ConnType::VIEW_CAMERA as i32 {
+        ConnType::VIEW_CAMERA
+    } else if conn_type == ConnType::FILE_TRANSFER as i32 {
+        ConnType::FILE_TRANSFER
+    } else if conn_type == ConnType::PORT_FORWARD as i32 {
+        ConnType::PORT_FORWARD
+    } else if conn_type == ConnType::RDP as i32 {
+        ConnType::RDP
+    } else if conn_type == ConnType::TERMINAL as i32 {
+        ConnType::TERMINAL
+    } else {
+        ConnType::DEFAULT_CONN
+    };
+    SyncReturn(sessions::get_session_count(id, conn_type))
 }
 
 pub fn session_add_existed_sync(
     id: String,
     session_id: SessionID,
     displays: Vec<i32>,
+    is_view_camera: bool,
 ) -> SyncReturn<String> {
-    if let Err(e) = session_add_existed(id.clone(), session_id, displays) {
+    if let Err(e) = session_add_existed(id.clone(), session_id, displays, is_view_camera) {
         SyncReturn(format!("Failed to add session with id {}, {}", &id, e))
     } else {
         SyncReturn("".to_owned())
@@ -115,26 +138,37 @@ pub fn session_add_sync(
     session_id: SessionID,
     id: String,
     is_file_transfer: bool,
+    is_view_camera: bool,
     is_port_forward: bool,
     is_rdp: bool,
+    is_terminal: bool,
     switch_uuid: String,
     force_relay: bool,
     password: String,
     is_shared_password: bool,
     conn_token: Option<String>,
 ) -> SyncReturn<String> {
-    if let Err(e) = session_add(
+    let add_res = session_add(
         &session_id,
         &id,
         is_file_transfer,
+        is_view_camera,
         is_port_forward,
         is_rdp,
+        is_terminal,
         &switch_uuid,
         force_relay,
         password,
         is_shared_password,
         conn_token,
-    ) {
+    );
+    // We can't put the remove call together with `std::env::var("IS_TERMINAL_ADMIN")`.
+    // Because there are some `bail!` in `session_add()`, we must make sure `IS_TERMINAL_ADMIN` is removed at last.
+    if is_terminal {
+        std::env::remove_var("IS_TERMINAL_ADMIN");
+    }
+
+    if let Err(e) = add_res {
         SyncReturn(format!("Failed to add session with id {}, {}", &id, e))
     } else {
         SyncReturn("".to_owned())
@@ -222,6 +256,10 @@ pub fn session_get_enable_trusted_devices(session_id: SessionID) -> SyncReturn<b
     SyncReturn(v)
 }
 
+pub fn will_session_close_close_session(session_id: SessionID) -> SyncReturn<bool> {
+    SyncReturn(sessions::would_remove_peer_by_session_id(&session_id))
+}
+
 pub fn session_close(session_id: SessionID) {
     if let Some(session) = sessions::remove_session_by_session_id(&session_id) {
         // `release_remote_keys` is not required for mobile platforms in common cases.
@@ -237,6 +275,19 @@ pub fn session_refresh(session_id: SessionID, display: usize) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.refresh_video(display as _);
     }
+}
+
+pub fn session_take_screenshot(session_id: SessionID, display: usize) {
+    if let Some(s) = sessions::get_session_by_session_id(&session_id) {
+        s.take_screenshot(display as _, session_id.to_string());
+    }
+}
+
+pub fn session_handle_screenshot(
+    #[allow(unused_variables)] session_id: SessionID,
+    action: String,
+) -> String {
+    crate::client::screenshot::handle_screenshot(action)
 }
 
 pub fn session_is_multi_ui_session(session_id: SessionID) -> SyncReturn<bool> {
@@ -274,9 +325,15 @@ pub fn session_toggle_option(session_id: SessionID, value: String) {
         session.toggle_option(value.clone());
         try_sync_peer_option(&session, &session_id, &value, None);
     }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     if sessions::get_session_by_session_id(&session_id).is_some() && value == "disable-clipboard" {
         crate::flutter::update_text_clipboard_required();
+    }
+    #[cfg(feature = "unix-file-copy-paste")]
+    if sessions::get_session_by_session_id(&session_id).is_some()
+        && value == config::keys::OPTION_ENABLE_FILE_COPY_PASTE
+    {
+        crate::flutter::update_file_clipboard_required();
     }
 }
 
@@ -346,6 +403,20 @@ pub fn session_get_scroll_style(session_id: SessionID) -> Option<String> {
 pub fn session_set_scroll_style(session_id: SessionID, value: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.save_scroll_style(value);
+    }
+}
+
+pub fn session_get_edge_scroll_edge_thickness(session_id: SessionID) -> Option<i32> {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        Some(session.get_edge_scroll_edge_thickness())
+    } else {
+        None
+    }
+}
+
+pub fn session_set_edge_scroll_edge_thickness(session_id: SessionID, value: i32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.save_edge_scroll_edge_thickness(value);
     }
 }
 
@@ -464,6 +535,20 @@ pub fn session_set_custom_fps(session_id: SessionID, fps: i32) {
     }
 }
 
+pub fn session_get_trackpad_speed(session_id: SessionID) -> Option<i32> {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        Some(session.get_trackpad_speed())
+    } else {
+        None
+    }
+}
+
+pub fn session_set_trackpad_speed(session_id: SessionID, value: i32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.save_trackpad_speed(value);
+    }
+}
+
 pub fn session_lock_screen(session_id: SessionID) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.lock_screen();
@@ -570,6 +655,36 @@ pub fn session_send_chat(session_id: SessionID, text: String) {
     }
 }
 
+// Terminal functions
+pub fn session_open_terminal(session_id: SessionID, terminal_id: i32, rows: u32, cols: u32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.open_terminal(terminal_id, rows, cols);
+    } else {
+        log::error!(
+            "[flutter_ffi] Session not found for session_id: {}",
+            session_id
+        );
+    }
+}
+
+pub fn session_send_terminal_input(session_id: SessionID, terminal_id: i32, data: String) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.send_terminal_input(terminal_id, data);
+    }
+}
+
+pub fn session_resize_terminal(session_id: SessionID, terminal_id: i32, rows: u32, cols: u32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.resize_terminal(terminal_id, rows, cols);
+    }
+}
+
+pub fn session_close_terminal(session_id: SessionID, terminal_id: i32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.close_terminal(terminal_id);
+    }
+}
+
 pub fn session_peer_option(session_id: SessionID, name: String, value: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.set_option(name, value);
@@ -607,7 +722,15 @@ pub fn session_send_files(
     _is_dir: bool,
 ) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.send_files(act_id, path, to, file_num, include_hidden, is_remote);
+        session.send_files(
+            act_id,
+            fs::JobType::Generic.into(),
+            path,
+            to,
+            file_num,
+            include_hidden,
+            is_remote,
+        );
     }
 }
 
@@ -682,6 +805,27 @@ pub fn session_read_local_dir_sync(
     "".to_string()
 }
 
+pub fn session_read_local_empty_dirs_recursive_sync(
+    _session_id: SessionID,
+    path: String,
+    include_hidden: bool,
+) -> String {
+    if let Ok(fds) = fs::get_empty_dirs_recursive(&path, include_hidden) {
+        return make_vec_fd_to_json(&fds);
+    }
+    "".to_string()
+}
+
+pub fn session_read_remote_empty_dirs_recursive_sync(
+    session_id: SessionID,
+    path: String,
+    include_hidden: bool,
+) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.read_empty_dirs(path, include_hidden);
+    }
+}
+
 pub fn session_get_platform(session_id: SessionID, is_remote: bool) -> String {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         return session.get_platform(is_remote);
@@ -711,7 +855,15 @@ pub fn session_add_job(
     is_remote: bool,
 ) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.add_job(act_id, path, to, file_num, include_hidden, is_remote);
+        session.add_job(
+            act_id,
+            fs::JobType::Generic.into(),
+            path,
+            to,
+            file_num,
+            include_hidden,
+            is_remote,
+        );
     }
 }
 
@@ -774,13 +926,6 @@ pub fn main_get_sound_inputs() -> Vec<String> {
     vec![String::from("")]
 }
 
-pub fn main_get_default_sound_input() -> Option<String> {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    return get_default_sound_input();
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    None
-}
-
 pub fn main_get_login_device_info() -> SyncReturn<String> {
     SyncReturn(get_login_device_info_json())
 }
@@ -820,12 +965,32 @@ pub fn main_show_option(_key: String) -> SyncReturn<bool> {
 pub fn main_set_option(key: String, value: String) {
     #[cfg(target_os = "android")]
     if key.eq(config::keys::OPTION_ENABLE_KEYBOARD) {
-        crate::ui_cm_interface::notify_input_control(config::option2bool(
-            config::keys::OPTION_ENABLE_KEYBOARD,
-            &value,
-        ));
+        crate::ui_cm_interface::switch_permission_all(
+            "keyboard".to_owned(),
+            config::option2bool(&key, &value),
+        );
     }
-    if key.eq("custom-rendezvous-server") {
+    #[cfg(target_os = "android")]
+    if key.eq(config::keys::OPTION_ENABLE_CLIPBOARD) {
+        crate::ui_cm_interface::switch_permission_all(
+            "clipboard".to_owned(),
+            config::option2bool(&key, &value),
+        );
+    }
+
+    // If `is_allow_tls_fallback` and https proxy is used, we need to restart rendezvous mediator.
+    // No need to check if https proxy is used, because this option does not change frequently
+    // and restarting mediator is safe even https proxy is not used.
+    let is_allow_tls_fallback = key.eq(config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK);
+    if is_allow_tls_fallback
+        || key.eq("custom-rendezvous-server")
+        || key.eq(config::keys::OPTION_ALLOW_WEBSOCKET)
+        || key.eq(config::keys::OPTION_DISABLE_UDP)
+        || key.eq("api-server")
+    {
+        if is_allow_tls_fallback {
+            hbb_common::tls::reset_tls_cache();
+        }
         set_option(key, value.clone());
         #[cfg(target_os = "android")]
         crate::rendezvous_mediator::RendezvousMediator::restart();
@@ -952,8 +1117,38 @@ pub fn main_get_env(key: String) -> SyncReturn<String> {
     SyncReturn(std::env::var(key).unwrap_or_default())
 }
 
+// Dart does not support changing environment variables.
+// `Platform.environment['MY_VAR'] = 'VAR';` will throw an error
+// `Unsupported operation: Cannot modify unmodifiable map`.
+//
+// And we need to share the environment variables between rust and dart isolates sometimes.
+pub fn main_set_env(key: String, value: Option<String>) -> SyncReturn<()> {
+    let is_valid_key = !key.is_empty() && !key.contains('=') && !key.contains('\0');
+    debug_assert!(is_valid_key, "Invalid environment variable key: {}", key);
+    if !is_valid_key {
+        log::error!("Invalid environment variable key: {}", key);
+        return SyncReturn(());
+    }
+
+    match value {
+        Some(v) => {
+            let is_valid_value = !v.contains('\0');
+            debug_assert!(is_valid_value, "Invalid environment variable value: {}", v);
+            if !is_valid_value {
+                log::error!("Invalid environment variable value: {}", v);
+                return SyncReturn(());
+            }
+            std::env::set_var(key, v);
+        }
+        None => std::env::remove_var(key),
+    }
+
+    SyncReturn(())
+}
+
 pub fn main_set_local_option(key: String, value: String) {
     let is_texture_render_key = key.eq(config::keys::OPTION_TEXTURE_RENDER);
+    let is_d3d_render_key = key.eq(config::keys::OPTION_ALLOW_D3D_RENDER);
     set_local_option(key, value.clone());
     if is_texture_render_key {
         let session_event = [("v", &value)];
@@ -961,6 +1156,11 @@ pub fn main_set_local_option(key: String, value: String) {
             session.push_event("use_texture_render", &session_event, &[]);
             session.use_texture_render_changed();
             session.ui_handler.update_use_texture_render();
+        }
+    }
+    if is_d3d_render_key {
+        for session in sessions::get_sessions() {
+            session.update_supported_decodings();
         }
     }
 }
@@ -1012,6 +1212,66 @@ pub fn main_set_input_source(session_id: SessionID, value: String) {
         if let Some(session) = sessions::get_session_by_session_id(&session_id) {
             try_sync_peer_option(&session, &session_id, "input_source", None);
         }
+    }
+}
+
+/// Set cursor position (for pointer lock re-centering).
+///
+/// # Returns
+/// - `true`: cursor position was successfully set
+/// - `false`: operation failed or not supported
+///
+/// # Platform behavior
+/// - Windows/macOS/Linux: attempts to move the cursor to (x, y)
+/// - Android/iOS: no-op, always returns `false`
+pub fn main_set_cursor_position(x: i32, y: i32) -> SyncReturn<bool> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        SyncReturn(crate::set_cursor_pos(x, y))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (x, y);
+        SyncReturn(false)
+    }
+}
+
+/// Clip cursor to a rectangle (for pointer lock).
+///
+/// When `enable` is true, the cursor is clipped to the rectangle defined by
+/// `left`, `top`, `right`, `bottom`. When `enable` is false, the rectangle
+/// values are ignored and the cursor is unclipped.
+///
+/// # Returns
+/// - `true`: operation succeeded or no-op completed
+/// - `false`: operation failed
+///
+/// # Platform behavior
+/// - Windows: uses ClipCursor API to confine cursor to the specified rectangle
+/// - macOS: uses CGAssociateMouseAndMouseCursorPosition for pointer lock effect;
+///   the rect coordinates are ignored (only Some/None matters)
+/// - Linux: no-op, always returns `true`; use pointer warping for similar effect
+/// - Android/iOS: no-op, always returns `false`
+pub fn main_clip_cursor(
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    enable: bool,
+) -> SyncReturn<bool> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let rect = if enable {
+            Some((left, top, right, bottom))
+        } else {
+            None
+        };
+        SyncReturn(crate::clip_cursor(rect))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (left, top, right, bottom, enable);
+        SyncReturn(false)
     }
 }
 
@@ -1076,55 +1336,76 @@ pub fn main_peer_exists(id: String) -> bool {
     peer_exists(&id)
 }
 
-pub fn main_load_recent_peers() {
-    if !config::APP_DIR.read().unwrap().is_empty() {
-        let peers: Vec<HashMap<&str, String>> = PeerConfig::peers(None)
-            .drain(..)
-            .map(|(id, _, p)| peer_to_map(id, p))
-            .collect();
+fn load_recent_peers(
+    vec_id_modified_time_path: &Vec<(String, SystemTime, std::path::PathBuf)>,
+    to_end: bool,
+    all_peers: &mut Vec<HashMap<&str, String>>,
+    from: usize,
+) -> usize {
+    let to = if to_end {
+        Some(vec_id_modified_time_path.len())
+    } else {
+        None
+    };
+    let mut peers_next = PeerConfig::batch_peers(vec_id_modified_time_path, from, to);
+    // There may be less peers than the batch size.
+    // But no need to consider this case, because it is a rare case.
+    let peers = peers_next.0.drain(..).map(|(id, _, p)| peer_to_map(id, p));
+    all_peers.extend(peers);
+    peers_next.1
+}
 
-        let data = HashMap::from([
-            ("name", "load_recent_peers".to_owned()),
-            (
-                "peers",
-                serde_json::ser::to_string(&peers).unwrap_or("".to_owned()),
-            ),
-        ]);
+pub fn main_load_recent_peers() {
+    let push_to_flutter = |peers, ids| {
+        let mut data = HashMap::from([("name", "load_recent_peers".to_owned()), ("peers", peers)]);
+        if let Some(ids) = ids {
+            data.insert("ids", ids);
+        }
         let _res = flutter::push_global_event(
             flutter::APP_TYPE_MAIN,
             serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
         );
-    }
-}
+    };
 
-pub fn main_load_recent_peers_sync() -> SyncReturn<String> {
     if !config::APP_DIR.read().unwrap().is_empty() {
-        let peers: Vec<HashMap<&str, String>> = PeerConfig::peers(None)
-            .drain(..)
-            .map(|(id, _, p)| peer_to_map(id, p))
-            .collect();
+        let vec_id_modified_time_path = PeerConfig::get_vec_id_modified_time_path(&None);
+        if vec_id_modified_time_path.is_empty() {
+            push_to_flutter("".to_owned(), None);
+            return;
+        }
 
-        let data = HashMap::from([
-            ("name", "load_recent_peers".to_owned()),
-            (
-                "peers",
-                serde_json::ser::to_string(&peers).unwrap_or("".to_owned()),
-            ),
-        ]);
-        return SyncReturn(serde_json::ser::to_string(&data).unwrap_or("".to_owned()));
+        let load_two_times = vec_id_modified_time_path.len() > PeerConfig::BATCH_LOADING_COUNT
+            && cfg!(target_os = "windows");
+        let mut all_peers = vec![];
+        if load_two_times {
+            let next_from = load_recent_peers(&vec_id_modified_time_path, false, &mut all_peers, 0);
+            let rest_ids = if next_from < vec_id_modified_time_path.len() {
+                Some(
+                    vec_id_modified_time_path[next_from..]
+                        .iter()
+                        .map(|(id, _, _)| id.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            } else {
+                None
+            };
+            push_to_flutter(
+                serde_json::ser::to_string(&all_peers).unwrap_or("".to_owned()),
+                rest_ids,
+            );
+            let _ = load_recent_peers(&vec_id_modified_time_path, true, &mut all_peers, next_from);
+        } else {
+            let _ = load_recent_peers(&vec_id_modified_time_path, true, &mut all_peers, 0);
+        }
+        // Don't check if `all_peers` is empty, because we need this message to update the state in the flutter side.
+        push_to_flutter(
+            serde_json::ser::to_string(&all_peers).unwrap_or("".to_owned()),
+            None,
+        );
+    } else {
+        push_to_flutter("".to_owned(), None)
     }
-    SyncReturn("".to_string())
-}
-
-pub fn main_load_lan_peers_sync() -> SyncReturn<String> {
-    let data = HashMap::from([
-        ("name", "load_lan_peers".to_owned()),
-        (
-            "peers",
-            serde_json::to_string(&get_lan_peers()).unwrap_or_default(),
-        ),
-    ]);
-    return SyncReturn(serde_json::ser::to_string(&data).unwrap_or("".to_owned()));
 }
 
 pub fn main_load_recent_peers_for_ab(filter: String) -> String {
@@ -1145,13 +1426,20 @@ pub fn main_load_recent_peers_for_ab(filter: String) -> String {
 }
 
 pub fn main_load_fav_peers() {
+    let push_to_flutter = |peers| {
+        let data = HashMap::from([("name", "load_fav_peers".to_owned()), ("peers", peers)]);
+        let _res = flutter::push_global_event(
+            flutter::APP_TYPE_MAIN,
+            serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
+        );
+    };
     if !config::APP_DIR.read().unwrap().is_empty() {
         let favs = get_fav();
-        let mut recent = PeerConfig::peers(None);
+        let mut recent = PeerConfig::peers(Some(favs.clone()));
         let mut lan = config::LanPeers::load()
             .peers
             .iter()
-            .filter(|d| recent.iter().all(|r| r.0 != d.id))
+            .filter(|d| favs.contains(&d.id) && recent.iter().all(|r| r.0 != d.id))
             .map(|d| {
                 (
                     d.id.clone(),
@@ -1170,26 +1458,12 @@ pub fn main_load_fav_peers() {
         recent.append(&mut lan);
         let peers: Vec<HashMap<&str, String>> = recent
             .into_iter()
-            .filter_map(|(id, _, p)| {
-                if favs.contains(&id) {
-                    Some(peer_to_map(id, p))
-                } else {
-                    None
-                }
-            })
+            .map(|(id, _, p)| peer_to_map(id, p))
             .collect();
 
-        let data = HashMap::from([
-            ("name", "load_fav_peers".to_owned()),
-            (
-                "peers",
-                serde_json::ser::to_string(&peers).unwrap_or("".to_owned()),
-            ),
-        ]);
-        let _res = flutter::push_global_event(
-            flutter::APP_TYPE_MAIN,
-            serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
-        );
+        push_to_flutter(serde_json::ser::to_string(&peers).unwrap_or("".to_owned()));
+    } else {
+        push_to_flutter("".to_owned());
     }
 }
 
@@ -1250,20 +1524,7 @@ pub fn main_handle_relay_id(id: String) -> String {
 }
 
 pub fn main_is_option_fixed(key: String) -> SyncReturn<bool> {
-    SyncReturn(
-        config::OVERWRITE_DISPLAY_SETTINGS
-            .read()
-            .unwrap()
-            .contains_key(&key)
-            || config::OVERWRITE_LOCAL_SETTINGS
-                .read()
-                .unwrap()
-                .contains_key(&key)
-            || config::OVERWRITE_SETTINGS
-                .read()
-                .unwrap()
-                .contains_key(&key),
-    )
+    SyncReturn(is_option_fixed(&key))
 }
 
 pub fn main_get_main_display() -> SyncReturn<String> {
@@ -1272,19 +1533,45 @@ pub fn main_get_main_display() -> SyncReturn<String> {
     #[cfg(not(target_os = "ios"))]
     let mut display_info = "".to_owned();
     #[cfg(not(target_os = "ios"))]
-    if let Ok(displays) = crate::display_service::try_get_displays() {
-        // to-do: Need to detect current display index.
-        if let Some(display) = displays.iter().next() {
-            display_info = serde_json::to_string(&HashMap::from([
-                ("w", display.width()),
-                ("h", display.height()),
-            ]))
-            .unwrap_or_default();
+    {
+        #[cfg(not(target_os = "linux"))]
+        let is_linux_wayland = false;
+        #[cfg(target_os = "linux")]
+        let is_linux_wayland = !is_x11();
+
+        if !is_linux_wayland {
+            if let Ok(displays) = crate::display_service::try_get_displays() {
+                // to-do: Need to detect current display index.
+                if let Some(display) = displays.iter().next() {
+                    display_info = serde_json::to_string(&HashMap::from([
+                        ("w", display.width()),
+                        ("h", display.height()),
+                    ]))
+                    .unwrap_or_default();
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if is_linux_wayland {
+            let displays = scrap::wayland::display::get_displays();
+            if let Some(display) = displays.displays.get(displays.primary) {
+                let logical_size = display
+                    .logical_size
+                    .unwrap_or((display.width, display.height));
+                display_info = serde_json::to_string(&HashMap::from([
+                    ("w", logical_size.0),
+                    ("h", logical_size.1),
+                ]))
+                .unwrap_or_default();
+            }
         }
     }
     SyncReturn(display_info)
 }
 
+// No need to check if is on Wayland in this function.
+// The Flutter side gets display information on Wayland using a different method.
 pub fn main_get_displays() -> SyncReturn<String> {
     #[cfg(target_os = "ios")]
     let display_info = "".to_owned();
@@ -1387,9 +1674,7 @@ pub fn main_get_last_remote_id() -> String {
 }
 
 pub fn main_get_software_update_url() {
-    if get_local_option("enable-check-update".to_string()) != "N" {
-        crate::common::check_software_update();
-    }
+    crate::common::check_software_update();
 }
 
 pub fn main_get_home_dir() -> String {
@@ -1523,8 +1808,99 @@ pub fn session_send_pointer(session_id: SessionID, msg: String) {
     super::flutter::session_send_pointer(session_id, msg);
 }
 
+/// Send mouse event from Flutter to the remote peer.
+///
+/// # Relative Mouse Mode Message Contract
+///
+/// When the message contains a `relative_mouse_mode` field, this function validates
+/// and filters activation/deactivation markers.
+///
+/// **Mode Authority:**
+/// The Flutter InputModel is authoritative for relative mouse mode activation/deactivation.
+/// The server (via `input_service.rs`) only consumes forwarded delta movements and tracks
+/// relative movement processing state, but does NOT control mode activation/deactivation.
+///
+/// **Deactivation Markers are Local-Only:**
+/// Deactivation markers (`relative_mouse_mode: "0"`) are NEVER forwarded to the server.
+/// They are handled entirely on the client side to reset local UI state (cursor visibility,
+/// pointer lock, etc.). The server does not rely on deactivation markers and should not
+/// expect to receive them.
+///
+/// **Contract (Flutter side MUST adhere to):**
+/// 1. `relative_mouse_mode` field is ONLY present on activation/deactivation marker messages,
+///    NEVER on normal pointer events (move, button, scroll).
+/// 2. Deactivation marker: `{"relative_mouse_mode": "0"}` - local-only, never forwarded.
+/// 3. Activation marker: `{"relative_mouse_mode": "1", "type": "move_relative", "x": "0", "y": "0"}`
+///    - MUST use `type="move_relative"` with `x="0"` and `y="0"` (safe no-op).
+///    - Any other combination is dropped to prevent accidental cursor movement.
+///
+/// If these assumptions are violated (e.g., `relative_mouse_mode` is added to normal events),
+/// legitimate mouse events may be silently dropped by the early-return logic below.
 pub fn session_send_mouse(session_id: SessionID, msg: String) {
     if let Ok(m) = serde_json::from_str::<HashMap<String, String>>(&msg) {
+        // Relative mouse mode marker validation (Flutter-only).
+        // This only validates and filters markers; the server tracks per-connection
+        // relative-movement processing state but not mode activation/deactivation.
+        // See doc comment above for the message contract.
+        if let Some(v) = m.get("relative_mouse_mode") {
+            let active = matches!(v.as_str(), "1" | "Y" | "on");
+
+            // Disable marker: local-only, never forwarded to the server.
+            // The server does not track mode deactivation; it simply stops receiving
+            // relative move events when the client exits relative mouse mode.
+            if !active {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                crate::keyboard::set_relative_mouse_mode_state(false);
+                return;
+            }
+
+            // Enable marker: validate BEFORE setting state to avoid desync.
+            // This ensures we only mark as active if the marker will actually be forwarded.
+
+            // Enable marker is allowed to go through only if it's a safe no-op relative move.
+            // This avoids accidentally moving the remote cursor (e.g. if type/x/y are missing).
+            let msg_type = m.get("type").map(|t| t.as_str());
+            if msg_type != Some("move_relative") {
+                log::warn!(
+                    "relative_mouse_mode activation marker has invalid type: {:?}, expected 'move_relative'. Dropping.",
+                    msg_type
+                );
+                return;
+            }
+            let x_marker = m
+                .get("x")
+                .map(|x| x.parse::<i32>().unwrap_or(0))
+                .unwrap_or(0);
+            let y_marker = m
+                .get("y")
+                .map(|y| y.parse::<i32>().unwrap_or(0))
+                .unwrap_or(0);
+            if x_marker != 0 || y_marker != 0 {
+                log::warn!(
+                    "relative_mouse_mode activation marker has non-zero coordinates: x={}, y={}. Dropping.",
+                    x_marker, y_marker
+                );
+                return;
+            }
+
+            // Guard against unexpected fields that could turn this no-op into a real event.
+            if m.contains_key("buttons")
+                || m.contains_key("alt")
+                || m.contains_key("ctrl")
+                || m.contains_key("shift")
+                || m.contains_key("command")
+            {
+                log::warn!(
+                    "relative_mouse_mode activation marker contains unexpected fields (buttons/alt/ctrl/shift/command). Dropping."
+                );
+                return;
+            }
+
+            // All validation passed - marker will be forwarded as a no-op relative move.
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            crate::keyboard::set_relative_mouse_mode_state(true);
+        }
+
         let alt = m.get("alt").is_some();
         let ctrl = m.get("ctrl").is_some();
         let shift = m.get("shift").is_some();
@@ -1544,6 +1920,7 @@ pub fn session_send_mouse(session_id: SessionID, msg: String) {
                 "up" => MOUSE_TYPE_UP,
                 "wheel" => MOUSE_TYPE_WHEEL,
                 "trackpad" => MOUSE_TYPE_TRACKPAD,
+                "move_relative" => MOUSE_TYPE_MOVE_RELATIVE,
                 _ => 0,
             };
         }
@@ -1584,6 +1961,36 @@ pub fn session_send_note(session_id: SessionID, note: String) {
     }
 }
 
+pub fn session_get_last_audit_note(session_id: SessionID) -> SyncReturn<String> {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        SyncReturn(session.last_audit_note.lock().unwrap().clone())
+    } else {
+        SyncReturn("".to_owned())
+    }
+}
+
+pub fn session_set_audit_guid(session_id: SessionID, guid: String) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        *session.audit_guid.lock().unwrap() = guid;
+    }
+}
+
+pub fn session_get_audit_guid(session_id: SessionID) -> SyncReturn<String> {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        SyncReturn(session.audit_guid.lock().unwrap().clone())
+    } else {
+        SyncReturn("".to_owned())
+    }
+}
+
+pub fn session_get_conn_session_id(session_id: SessionID) -> SyncReturn<String> {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        SyncReturn(session.lc.read().unwrap().session_id.to_string())
+    } else {
+        SyncReturn("".to_owned())
+    }
+}
+
 pub fn session_alternative_codecs(session_id: SessionID) -> String {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         let (vp8, av1, h264, h265) = session.alternative_codecs();
@@ -1596,7 +2003,7 @@ pub fn session_alternative_codecs(session_id: SessionID) -> String {
 
 pub fn session_change_prefer_codec(session_id: SessionID) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.change_prefer_codec();
+        session.update_supported_decodings();
     }
 }
 
@@ -1611,6 +2018,17 @@ pub fn session_toggle_virtual_display(session_id: SessionID, index: i32, on: boo
     }
 }
 
+pub fn session_printer_response(
+    session_id: SessionID,
+    id: i32,
+    path: String,
+    printer_name: String,
+) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.printer_response(id, path, printer_name);
+    }
+}
+
 pub fn main_set_home_dir(_home: String) {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
@@ -1619,7 +2037,8 @@ pub fn main_set_home_dir(_home: String) {
 }
 
 // This is a temporary method to get data dir for ios
-pub fn main_get_data_dir_ios() -> SyncReturn<String> {
+pub fn main_get_data_dir_ios(app_dir: String) -> SyncReturn<String> {
+    *config::APP_DIR.write().unwrap() = app_dir;
     let data_dir = config::Config::path("data");
     if !data_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&data_dir) {
@@ -1928,13 +2347,7 @@ pub fn main_hide_dock() -> SyncReturn<bool> {
 }
 
 pub fn main_has_file_clipboard() -> SyncReturn<bool> {
-    let ret = cfg!(any(
-        target_os = "windows",
-        all(
-            feature = "unix-file-copy-paste",
-            any(target_os = "linux", target_os = "macos")
-        )
-    ));
+    let ret = cfg!(any(target_os = "windows", feature = "unix-file-copy-paste",));
     SyncReturn(ret)
 }
 
@@ -1981,7 +2394,7 @@ pub fn is_outgoing_only() -> SyncReturn<bool> {
 }
 
 pub fn is_custom_client() -> SyncReturn<bool> {
-    SyncReturn(get_app_name() != "RustDesk")
+    SyncReturn(crate::common::is_custom_client())
 }
 
 pub fn is_disable_settings() -> SyncReturn<bool> {
@@ -2301,13 +2714,246 @@ pub fn session_request_new_display_init_msgs(session_id: SessionID, display: usi
     }
 }
 
+pub fn main_audio_support_loopback() -> SyncReturn<bool> {
+    #[cfg(target_os = "windows")]
+    let is_surpport = true;
+    #[cfg(feature = "screencapturekit")]
+    let is_surpport = crate::audio_service::is_screen_capture_kit_available();
+    #[cfg(not(any(target_os = "windows", feature = "screencapturekit")))]
+    let is_surpport = false;
+    SyncReturn(is_surpport)
+}
+
+pub fn main_get_printer_names() -> SyncReturn<String> {
+    #[cfg(target_os = "windows")]
+    return SyncReturn(
+        serde_json::to_string(&crate::platform::windows::get_printer_names().unwrap_or_default())
+            .unwrap_or_default(),
+    );
+    #[cfg(not(target_os = "windows"))]
+    return SyncReturn("".to_owned());
+}
+
+pub fn main_get_common(key: String) -> String {
+    if key == "is-printer-installed" {
+        #[cfg(target_os = "windows")]
+        {
+            return match remote_printer::is_rd_printer_installed(&get_app_name()) {
+                Ok(r) => r.to_string(),
+                Err(e) => e.to_string(),
+            };
+        }
+        #[cfg(not(target_os = "windows"))]
+        return false.to_string();
+    } else if key == "is-support-printer-driver" {
+        #[cfg(target_os = "windows")]
+        return crate::platform::is_win_10_or_greater().to_string();
+        #[cfg(not(target_os = "windows"))]
+        return false.to_string();
+    } else if key == "transfer-job-id" {
+        return hbb_common::fs::get_next_job_id().to_string();
+    } else if key == "is-remote-modify-enabled-by-control-permissions" {
+        return match is_remote_modify_enabled_by_control_permissions() {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "",
+        }
+        .to_string();
+    } else {
+        if key.starts_with("download-data-") {
+            let id = key.replace("download-data-", "");
+            match crate::hbbs_http::downloader::get_download_data(&id) {
+                Ok(data) => serde_json::to_string(&data).unwrap_or_default(),
+                Err(e) => {
+                    format!("error:{}", e)
+                }
+            }
+        } else if key.starts_with("download-file-") {
+            let _version = key.replace("download-file-", "");
+            #[cfg(target_os = "windows")]
+            return match crate::platform::windows::is_msi_installed() {
+                Ok(true) => format!("rustdesk-{_version}-x86_64.msi"),
+                Ok(false) => format!("rustdesk-{_version}-x86_64.exe"),
+                Err(e) => {
+                    log::error!("Failed to check if is msi: {}", e);
+                    format!("error:update-failed-check-msi-tip")
+                }
+            };
+            #[cfg(target_os = "macos")]
+            {
+                return if cfg!(target_arch = "x86_64") {
+                    format!("rustdesk-{_version}-x86_64.dmg")
+                } else if cfg!(target_arch = "aarch64") {
+                    format!("rustdesk-{_version}-aarch64.dmg")
+                } else {
+                    "error:unsupported".to_owned()
+                };
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                "error:unsupported".to_owned()
+            }
+        } else {
+            "".to_owned()
+        }
+    }
+}
+
+pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
+    SyncReturn(main_get_common(key))
+}
+
+pub fn main_set_common(_key: String, _value: String) {
+    #[cfg(target_os = "windows")]
+    if _key == "install-printer" && crate::platform::is_win_10_or_greater() {
+        std::thread::spawn(move || {
+            let (success, msg) = match remote_printer::install_update_printer(&get_app_name()) {
+                Ok(_) => (true, "".to_owned()),
+                Err(e) => {
+                    let err = e.to_string();
+                    log::error!("Failed to install/update rd printer: {}", &err);
+                    (false, err)
+                }
+            };
+            if success {
+                // Use `ipc` to notify the server process to update the install option in the registry.
+                // Because `install_update_printer()` may prompt for permissions, there is no need to prompt again here.
+                if let Err(e) = crate::ipc::set_install_option(
+                    crate::platform::REG_NAME_INSTALL_PRINTER.to_string(),
+                    "1".to_string(),
+                ) {
+                    log::error!("Failed to set install printer option: {}", e);
+                }
+            }
+            let data = HashMap::from([
+                ("name", serde_json::json!("install-printer-res")),
+                ("success", serde_json::json!(success)),
+                ("msg", serde_json::json!(msg)),
+            ]);
+            let _res = flutter::push_global_event(
+                flutter::APP_TYPE_MAIN,
+                serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
+            );
+        });
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        use crate::updater::get_download_file_from_url;
+        if _key == "download-new-version" {
+            let download_url = _value.clone();
+            let event_key = "download-new-version".to_owned();
+            let data = if let Some(download_file) = get_download_file_from_url(&download_url) {
+                std::fs::remove_file(&download_file).ok();
+                match crate::hbbs_http::downloader::download_file(
+                    download_url,
+                    Some(PathBuf::from(download_file)),
+                    Some(Duration::from_secs(3)),
+                ) {
+                    Ok(id) => HashMap::from([("name", event_key), ("id", id)]),
+                    Err(e) => HashMap::from([("name", event_key), ("error", e.to_string())]),
+                }
+            } else {
+                HashMap::from([
+                    ("name", event_key),
+                    ("error", "Invalid download url".to_string()),
+                ])
+            };
+            let _res = flutter::push_global_event(
+                flutter::APP_TYPE_MAIN,
+                serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
+            );
+        } else if _key == "update-me" {
+            if let Some(new_version_file) = get_download_file_from_url(&_value) {
+                log::debug!(
+                    "New version file is downloaed, update begin, {:?}",
+                    new_version_file.to_str()
+                );
+                if let Some(f) = new_version_file.to_str() {
+                    // 1.4.0 does not support "--update"
+                    // But we can assume that the new version supports it.
+                    #[cfg(target_os = "windows")]
+                    if f.ends_with(".exe") {
+                        if let Err(e) =
+                            crate::platform::run_exe_in_cur_session(f, vec!["--update"], false)
+                        {
+                            log::error!("Failed to run the update exe: {}", e);
+                        }
+                    } else if f.ends_with(".msi") {
+                        if let Err(e) = crate::platform::update_me_msi(f, false) {
+                            log::error!("Failed to run the update msi: {}", e);
+                        }
+                    } else {
+                        // unreachable!()
+                    }
+                    #[cfg(target_os = "macos")]
+                    match crate::platform::update_to(f) {
+                        Ok(_) => {
+                            log::info!("Update successfully!");
+                        }
+                        Err(e) => {
+                            log::error!("Failed to update to new version, {}", e);
+                        }
+                    }
+                    fs::remove_file(f).ok();
+                }
+            }
+        } else if _key == "extract-update-dmg" {
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(new_version_file) = get_download_file_from_url(&_value) {
+                    if let Some(f) = new_version_file.to_str() {
+                        crate::platform::macos::extract_update_dmg(f);
+                    } else {
+                        // unreachable!()
+                        log::error!("Failed to get the new version file path");
+                    }
+                } else {
+                    // unreachable!()
+                    log::error!("Failed to get the new version file from url: {}", _value);
+                }
+            }
+        }
+    }
+
+    if _key == "remove-downloader" {
+        crate::hbbs_http::downloader::remove(&_value);
+    } else if _key == "cancel-downloader" {
+        crate::hbbs_http::downloader::cancel(&_value);
+    }
+}
+
+pub fn session_get_common_sync(
+    session_id: SessionID,
+    key: String,
+    param: String,
+) -> SyncReturn<Option<String>> {
+    SyncReturn(session_get_common(session_id, key, param))
+}
+
+pub fn session_get_common(
+    session_id: SessionID,
+    key: String,
+    #[allow(unused_variables)] param: String,
+) -> Option<String> {
+    if let Some(s) = sessions::get_session_by_session_id(&session_id) {
+        let v = if key == "is_screenshot_supported" {
+            s.is_screenshot_supported().to_string()
+        } else {
+            "".to_owned()
+        };
+        Some(v)
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "android")]
 pub mod server_side {
     use hbb_common::{config, log};
     use jni::{
         errors::{Error as JniError, Result as JniResult},
         objects::{JClass, JObject, JString},
-        sys::jstring,
+        sys::{jboolean, jstring},
         JNIEnv,
     };
 
@@ -2379,5 +3025,13 @@ pub mod server_side {
             "".into()
         };
         return env.new_string(res).unwrap_or_default().into_raw();
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_ffi_FFI_isServiceClipboardEnabled(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jboolean {
+        jboolean::from(crate::server::is_clipboard_service_ok())
     }
 }

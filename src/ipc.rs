@@ -1,4 +1,5 @@
 use crate::{
+    common::CheckTestNatType,
     privacy_mode::PrivacyModeState,
     ui_interface::{get_local_option, set_local_option},
 };
@@ -22,12 +23,14 @@ pub use clipboard::ClipboardFile;
 use hbb_common::{
     allow_err, bail, bytes,
     bytes_codec::BytesCodec,
-    config::{self, Config, Config2},
+    config::{
+        self,
+        keys::{self, OPTION_ALLOW_WEBSOCKET},
+        Config, Config2,
+    },
     futures::StreamExt as _,
     futures_util::sink::SinkExt,
-    log, password_security as password,
-    sodiumoxide::base64,
-    timeout,
+    log, password_security as password, timeout,
     tokio::{
         self,
         io::{AsyncRead, AsyncWrite},
@@ -45,6 +48,10 @@ pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "t", content = "c")]
 pub enum FS {
+    ReadEmptyDirs {
+        dir: String,
+        include_hidden: bool,
+    },
     ReadDir {
         dir: String,
         include_hidden: bool,
@@ -101,11 +108,40 @@ pub enum FS {
         file_size: u64,
         last_modified: u64,
         is_upload: bool,
+        is_resume: bool,
     },
+    SendConfirm(Vec<u8>),
     Rename {
         id: i32,
         path: String,
         new_name: String,
+    },
+    // CM-side file reading operations (Windows only)
+    // These enable Connection Manager to read files and stream them back to Connection
+    ReadFile {
+        path: String,
+        id: i32,
+        file_num: i32,
+        include_hidden: bool,
+        conn_id: i32,
+        overwrite_detection: bool,
+    },
+    CancelRead {
+        id: i32,
+        conn_id: i32,
+    },
+    SendConfirmForRead {
+        id: i32,
+        file_num: i32,
+        skip: bool,
+        offset_blk: u32,
+        conn_id: i32,
+    },
+    ReadAllFiles {
+        path: String,
+        id: i32,
+        include_hidden: bool,
+        conn_id: i32,
     },
 }
 
@@ -172,7 +208,7 @@ pub enum DataPortableService {
     Ping,
     Pong,
     ConnCount(Option<usize>),
-    Mouse((Vec<u8>, i32)),
+    Mouse((Vec<u8>, i32, String, u32, bool, bool)),
     Pointer((Vec<u8>, i32)),
     Key(Vec<u8>),
     RequestStart,
@@ -186,6 +222,8 @@ pub enum Data {
     Login {
         id: i32,
         is_file_transfer: bool,
+        is_view_camera: bool,
+        is_terminal: bool,
         peer_id: String,
         name: String,
         authorized: bool,
@@ -213,8 +251,6 @@ pub enum Data {
     MouseMoveTime(i64),
     Authorize,
     Close,
-    #[cfg(target_os = "android")]
-    InputControl(bool),
     #[cfg(windows)]
     SAS,
     UserSid(Option<u32>),
@@ -228,7 +264,7 @@ pub enum Data {
     FS(FS),
     Test,
     SyncConfig(Option<Box<(Config, Config2)>>),
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(target_os = "windows")]
     ClipboardFile(ClipboardFile),
     ClipboardFileEnabled(bool),
     #[cfg(target_os = "windows")]
@@ -263,13 +299,98 @@ pub enum Data {
     #[cfg(windows)]
     ControlledSessionCount(usize),
     CmErr(String),
+    // CM-side file reading responses (Windows only)
+    // These are sent from CM back to Connection when CM handles file reading
+    /// Response to ReadFile: contains initial file list or error
+    ReadJobInitResult {
+        id: i32,
+        file_num: i32,
+        include_hidden: bool,
+        conn_id: i32,
+        /// Serialized protobuf bytes of FileDirectory, or error string
+        result: Result<Vec<u8>, String>,
+    },
+    /// File data block read by CM.
+    ///
+    /// The actual data is sent separately via `send_raw()` after this message to avoid
+    /// JSON encoding overhead for large binary data. This mirrors the `WriteBlock` pattern.
+    ///
+    /// **Protocol:**
+    /// - Sender: `send(FileBlockFromCM{...})` then `send_raw(data)`
+    /// - Receiver: `next()` returns `FileBlockFromCM`, then `next_raw()` returns data bytes
+    ///
+    /// **Note on empty data (e.g., empty files):**
+    /// Empty data is supported. The IPC connection uses `BytesCodec` with `raw=false` (default),
+    /// which prefixes each frame with a length header. So `send_raw(Bytes::new())` sends a
+    /// 1-byte frame (length=0), and `next_raw()` correctly returns an empty `BytesMut`.
+    /// See `libs/hbb_common/src/bytes_codec.rs` test `test_codec2` for verification.
+    FileBlockFromCM {
+        id: i32,
+        file_num: i32,
+        /// Data is sent separately via `send_raw()` to avoid JSON encoding overhead.
+        /// This field is skipped during serialization; sender must call `send_raw()` after sending.
+        /// Receiver must call `next_raw()` and populate this field manually.
+        #[serde(skip)]
+        data: bytes::Bytes,
+        compressed: bool,
+        conn_id: i32,
+    },
+    /// File read completed successfully
+    FileReadDone {
+        id: i32,
+        file_num: i32,
+        conn_id: i32,
+    },
+    /// File read failed with error
+    FileReadError {
+        id: i32,
+        file_num: i32,
+        err: String,
+        conn_id: i32,
+    },
+    /// Digest info from CM for overwrite detection
+    FileDigestFromCM {
+        id: i32,
+        file_num: i32,
+        last_modified: u64,
+        file_size: u64,
+        is_resume: bool,
+        conn_id: i32,
+    },
+    /// Response to ReadAllFiles: recursive directory listing
+    AllFilesResult {
+        id: i32,
+        conn_id: i32,
+        path: String,
+        /// Serialized protobuf bytes of FileDirectory, or error string
+        result: Result<Vec<u8>, String>,
+    },
     CheckHwcodec,
+    #[cfg(feature = "flutter")]
     VideoConnCount(Option<usize>),
-    // Although the key is not neccessary, it is used to avoid hardcoding the key.
+    // Although the key is not necessary, it is used to avoid hardcoding the key.
     WaylandScreencastRestoreToken((String, String)),
     HwCodecConfig(Option<String>),
     RemoveTrustedDevices(Vec<Bytes>),
     ClearTrustedDevices,
+    #[cfg(all(target_os = "windows", feature = "flutter"))]
+    PrinterData(Vec<u8>),
+    InstallOption(Option<(String, String)>),
+    #[cfg(all(
+        feature = "flutter",
+        not(any(target_os = "android", target_os = "ios"))
+    ))]
+    ControllingSessionCount(usize),
+    #[cfg(target_os = "linux")]
+    TerminalSessionCount(usize),
+    #[cfg(target_os = "windows")]
+    PortForwardSessionCount(Option<usize>),
+    SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    Whiteboard((String, crate::whiteboard::CustomEvent)),
+    ControlPermissionsRemoteModify(Option<bool>),
+    #[cfg(target_os = "windows")]
+    FileTransferEnabledState(Option<bool>),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -336,29 +457,56 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     }
 }
 
-pub struct CheckIfRestart(String, Vec<String>, String, String);
+pub struct CheckIfRestart {
+    stop_service: String,
+    rendezvous_servers: Vec<String>,
+    audio_input: String,
+    voice_call_input: String,
+    ws: String,
+    disable_udp: String,
+    allow_insecure_tls_fallback: String,
+    api_server: String,
+}
 
 impl CheckIfRestart {
     pub fn new() -> CheckIfRestart {
-        CheckIfRestart(
-            Config::get_option("stop-service"),
-            Config::get_rendezvous_servers(),
-            Config::get_option("audio-input"),
-            Config::get_option("voice-call-input"),
-        )
+        CheckIfRestart {
+            stop_service: Config::get_option("stop-service"),
+            rendezvous_servers: Config::get_rendezvous_servers(),
+            audio_input: Config::get_option("audio-input"),
+            voice_call_input: Config::get_option("voice-call-input"),
+            ws: Config::get_option(OPTION_ALLOW_WEBSOCKET),
+            disable_udp: Config::get_option(config::keys::OPTION_DISABLE_UDP),
+            allow_insecure_tls_fallback: Config::get_option(
+                config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK,
+            ),
+            api_server: Config::get_option("api-server"),
+        }
     }
 }
 impl Drop for CheckIfRestart {
     fn drop(&mut self) {
-        if self.0 != Config::get_option("stop-service")
-            || self.1 != Config::get_rendezvous_servers()
+        // If https proxy is used, we need to restart rendezvous mediator.
+        // No need to check if https proxy is used, because this option does not change frequently
+        // and restarting mediator is safe even https proxy is not used.
+        let allow_insecure_tls_fallback_changed = self.allow_insecure_tls_fallback
+            != Config::get_option(config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK);
+        if allow_insecure_tls_fallback_changed
+            || self.stop_service != Config::get_option("stop-service")
+            || self.rendezvous_servers != Config::get_rendezvous_servers()
+            || self.ws != Config::get_option(OPTION_ALLOW_WEBSOCKET)
+            || self.disable_udp != Config::get_option(config::keys::OPTION_DISABLE_UDP)
+            || self.api_server != Config::get_option("api-server")
         {
+            if allow_insecure_tls_fallback_changed {
+                hbb_common::tls::reset_tls_cache();
+            }
             RendezvousMediator::restart();
         }
-        if self.2 != Config::get_option("audio-input") {
+        if self.audio_input != Config::get_option("audio-input") {
             crate::audio_service::restart();
         }
-        if self.3 != Config::get_option("voice-call-input") {
+        if self.voice_call_input != Config::get_option("voice-call-input") {
             crate::audio_service::set_voice_call_input_device(
                 Some(Config::get_option("voice-call-input")),
                 true,
@@ -443,22 +591,36 @@ async fn handle(data: Data, stream: &mut Connection) {
                 allow_err!(stream.send(&Data::Socks(Config::get_socks())).await);
             }
             Some(data) => {
+                let _nat = CheckTestNatType::new();
                 if data.proxy.is_empty() {
                     Config::set_socks(None);
                 } else {
                     Config::set_socks(Some(data));
                 }
-                crate::common::test_nat_type();
                 RendezvousMediator::restart();
                 log::info!("socks updated");
             }
         },
+        Data::SocksWs(s) => match s {
+            None => {
+                allow_err!(
+                    stream
+                        .send(&Data::SocksWs(Some(Box::new((
+                            Config::get_socks(),
+                            Config::get_option(OPTION_ALLOW_WEBSOCKET)
+                        )))))
+                        .await
+                );
+            }
+            _ => {}
+        },
+        #[cfg(feature = "flutter")]
         Data::VideoConnCount(None) => {
             let n = crate::server::AUTHED_CONNS
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|x| x.1 == crate::server::AuthConnType::Remote)
+                .filter(|x| x.conn_type == crate::server::AuthConnType::Remote)
                 .count();
             allow_err!(stream.send(&Data::VideoConnCount(Some(n))).await);
         }
@@ -488,7 +650,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                         None
                     };
                 } else if name == "hide_cm" {
-                    value = if crate::hbbs_http::sync::is_pro() {
+                    value = if crate::hbbs_http::sync::is_pro() || crate::common::is_custom_client()
+                    {
                         Some(hbb_common::password_security::hide_cm().to_string())
                     } else {
                         None
@@ -531,6 +694,7 @@ async fn handle(data: Data, stream: &mut Connection) {
             }
             Some(value) => {
                 let _chk = CheckIfRestart::new();
+                let _nat = CheckTestNatType::new();
                 if let Some(v) = value.get("privacy-mode-impl-key") {
                     crate::privacy_mode::switch(v);
                 }
@@ -592,6 +756,18 @@ async fn handle(data: Data, stream: &mut Connection) {
                     ))
                     .await
             );
+        }
+        #[cfg(all(
+            feature = "flutter",
+            not(any(target_os = "android", target_os = "ios"))
+        ))]
+        Data::ControllingSessionCount(count) => {
+            crate::updater::update_controlling_session_count(count);
+        }
+        #[cfg(target_os = "linux")]
+        Data::TerminalSessionCount(_) => {
+            let count = crate::terminal_service::get_terminal_session_count(true);
+            allow_err!(stream.send(&Data::TerminalSessionCount(count)).await);
         }
         #[cfg(feature = "hwcodec")]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -656,6 +832,67 @@ async fn handle(data: Data, stream: &mut Connection) {
         }
         Data::ClearTrustedDevices => {
             Config::clear_trusted_devices();
+        }
+        Data::InstallOption(opt) => match opt {
+            Some((_k, _v)) => {
+                #[cfg(target_os = "windows")]
+                if let Err(e) = crate::platform::windows::update_install_option(&_k, &_v) {
+                    log::error!(
+                        "Failed to update install option \"{}\" to \"{}\", error: {}",
+                        &_k,
+                        &_v,
+                        e
+                    );
+                }
+            }
+            None => {
+                // `None` is usually used to get values.
+                // This branch is left blank for unification and further use.
+            }
+        },
+        #[cfg(target_os = "windows")]
+        Data::PortForwardSessionCount(c) => match c {
+            None => {
+                let count = crate::server::AUTHED_CONNS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c.conn_type == crate::server::AuthConnType::PortForward)
+                    .count();
+                allow_err!(
+                    stream
+                        .send(&Data::PortForwardSessionCount(Some(count)))
+                        .await
+                );
+            }
+            _ => {
+                // Port forward session count is only a get value.
+            }
+        },
+        Data::ControlPermissionsRemoteModify(_) => {
+            use hbb_common::rendezvous_proto::control_permissions::Permission;
+            let state =
+                crate::server::get_control_permission_state(Permission::remote_modify, true);
+            allow_err!(
+                stream
+                    .send(&Data::ControlPermissionsRemoteModify(state))
+                    .await
+            );
+        }
+        #[cfg(target_os = "windows")]
+        Data::FileTransferEnabledState(_) => {
+            use hbb_common::rendezvous_proto::control_permissions::Permission;
+            let state = crate::server::get_control_permission_state(Permission::file, false);
+            let enabled = state.unwrap_or_else(|| {
+                crate::server::Connection::is_permission_enabled_locally(
+                    config::keys::OPTION_ENABLE_FILE_TRANSFER,
+                )
+            });
+            allow_err!(
+                stream
+                    .send(&Data::FileTransferEnabledState(Some(enabled)))
+                    .await
+            );
         }
         _ => {}
     }
@@ -1057,6 +1294,7 @@ pub fn set_option(key: &str, value: &str) {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
+    let _nat = CheckTestNatType::new();
     if let Ok(mut c) = connect(1000, "").await {
         c.send(&Data::Options(Some(value.clone()))).await?;
         // do not put below before connect, because we need to check should_exit
@@ -1114,6 +1352,7 @@ pub async fn get_socks() -> Option<config::Socks5Server> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_socks(value: config::Socks5Server) -> ResultType<()> {
+    let _nat = CheckTestNatType::new();
     Config::set_socks(if value.proxy.is_empty() {
         None
     } else {
@@ -1124,6 +1363,29 @@ pub async fn set_socks(value: config::Socks5Server) -> ResultType<()> {
         .send(&Data::Socks(Some(value)))
         .await?;
     Ok(())
+}
+
+async fn get_socks_ws_(ms_timeout: u64) -> ResultType<(Option<config::Socks5Server>, String)> {
+    let mut c = connect(ms_timeout, "").await?;
+    c.send(&Data::SocksWs(None)).await?;
+    if let Some(Data::SocksWs(Some(value))) = c.next_timeout(ms_timeout).await? {
+        Config::set_socks(value.0.clone());
+        Config::set_option(OPTION_ALLOW_WEBSOCKET.to_string(), value.1.clone());
+        Ok(*value)
+    } else {
+        Ok((
+            Config::get_socks(),
+            Config::get_option(OPTION_ALLOW_WEBSOCKET),
+        ))
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_socks_ws() -> (Option<config::Socks5Server>, String) {
+    get_socks_ws_(1_000).await.unwrap_or((
+        Config::get_socks(),
+        Config::get_option(OPTION_ALLOW_WEBSOCKET),
+    ))
 }
 
 pub fn get_proxy_status() -> bool {
@@ -1164,6 +1426,16 @@ pub async fn connect_to_user_session(usid: Option<u32>) -> ResultType<()> {
 pub async fn notify_server_to_check_hwcodec() -> ResultType<()> {
     connect(1_000, "").await?.send(&&Data::CheckHwcodec).await?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub async fn get_port_forward_session_count(ms_timeout: u64) -> ResultType<usize> {
+    let mut c = connect(ms_timeout, "").await?;
+    c.send(&Data::PortForwardSessionCount(None)).await?;
+    if let Some(Data::PortForwardSessionCount(Some(count))) = c.next_timeout(ms_timeout).await? {
+        return Ok(count);
+    }
+    bail!("Failed to get port forward session count");
 }
 
 #[cfg(feature = "hwcodec")]
@@ -1257,6 +1529,29 @@ pub async fn clear_wayland_screencast_restore_token(key: String) -> ResultType<b
     return Ok(false);
 }
 
+#[cfg(all(
+    feature = "flutter",
+    not(any(target_os = "android", target_os = "ios"))
+))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn update_controlling_session_count(count: usize) -> ResultType<()> {
+    let mut c = connect(1000, "").await?;
+    c.send(&Data::ControllingSessionCount(count)).await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_terminal_session_count() -> ResultType<usize> {
+    let ms_timeout = 1_000;
+    let mut c = connect(ms_timeout, "").await?;
+    c.send(&Data::TerminalSessionCount(0)).await?;
+    if let Some(Data::TerminalSessionCount(c)) = c.next_timeout(ms_timeout).await? {
+        return Ok(c);
+    }
+    Ok(0)
+}
+
 async fn handle_wayland_screencast_restore_token(
     key: String,
     value: String,
@@ -1272,12 +1567,22 @@ async fn handle_wayland_screencast_restore_token(
     return Ok(None);
 }
 
+#[tokio::main(flavor = "current_thread")]
+pub async fn set_install_option(k: String, v: String) -> ResultType<()> {
+    if let Ok(mut c) = connect(1000, "").await {
+        c.send(&&Data::InstallOption(Some((k, v)))).await?;
+        // do not put below before connect, because we need to check should_exit
+        c.next_timeout(1000).await.ok();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     #[test]
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
-        assert!(std::mem::size_of::<Data>() < 96);
+        assert!(std::mem::size_of::<Data>() <= 96);
     }
 }
