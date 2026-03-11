@@ -473,8 +473,7 @@ class _GeneralState extends State<_General> {
   }
 
   Widget other() {
-    final showAutoUpdate =
-        isWindows && bind.mainIsInstalled() && !bind.isCustomClient();
+    final showAutoUpdate = isWindows && bind.mainIsInstalled();
     final children = <Widget>[
       if (!isWeb && !bind.isIncomingOnly())
         _OptionCheckBox(context, 'Confirm before closing multiple tabs',
@@ -2016,7 +2015,9 @@ class _AccountState extends State<_Account> {
 
   Widget accountAction() {
     return Obx(() => _Button(
-        gFFI.userModel.userName.value.isEmpty ? 'Login' : 'Logout',
+        gFFI.userModel.userName.value.isEmpty
+            ? 'Login'
+            : '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})',
         () => {
               gFFI.userModel.userName.value.isEmpty
                   ? loginDialog()
@@ -2025,23 +2026,64 @@ class _AccountState extends State<_Account> {
   }
 
   Widget useInfo() {
-    text(String key, String value) {
-      return Align(
-        alignment: Alignment.centerLeft,
-        child: SelectionArea(child: Text('${translate(key)}: $value'))
-            .marginSymmetric(vertical: 4),
-      );
-    }
-
     return Obx(() => Offstage(
           offstage: gFFI.userModel.userName.value.isEmpty,
-          child: Column(
-            children: [
-              text('Username', gFFI.userModel.userName.value),
-              // text('Group', gFFI.groupModel.groupName.value),
-            ],
+          child: Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Builder(builder: (context) {
+              final avatarWidget = _buildUserAvatar();
+              return Row(
+                children: [
+                  if (avatarWidget != null) avatarWidget,
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          gFFI.userModel.displayNameOrUserName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        SelectionArea(
+                          child: Text(
+                            '@${gFFI.userModel.userName.value}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color:
+                                  Theme.of(context).textTheme.bodySmall?.color,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            }),
           ),
         )).marginOnly(left: 18, top: 16);
+  }
+
+  Widget? _buildUserAvatar() {
+    // Resolve relative avatar path at display time
+    final avatar =
+        bind.mainResolveAvatarUrl(avatar: gFFI.userModel.avatar.value);
+    return buildAvatarWidget(
+      avatar: avatar,
+      size: 44,
+    );
   }
 }
 
@@ -2130,7 +2172,9 @@ class _PluginState extends State<_Plugin> {
 
   Widget accountAction() {
     return Obx(() => _Button(
-        gFFI.userModel.userName.value.isEmpty ? 'Login' : 'Logout',
+        gFFI.userModel.userName.value.isEmpty
+            ? 'Login'
+            : '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})',
         () => {
               gFFI.userModel.userName.value.isEmpty
                   ? loginDialog()
@@ -2538,6 +2582,49 @@ class WaylandCard extends StatefulWidget {
 
 class _WaylandCardState extends State<WaylandCard> {
   final restoreTokenKey = 'wayland-restore-token';
+  static const _kClearShortcutsInhibitorEventKey =
+      'clear-gnome-shortcuts-inhibitor-permission-res';
+  final _clearShortcutsInhibitorFailedMsg = ''.obs;
+  // Don't show the shortcuts permission reset button for now.
+  // Users can change it manually:
+  //   "Settings" -> "Apps" -> "RustDesk" -> "Permissions" -> "Inhibit Shortcuts".
+  // For resetting(clearing) the permission from the portal permission store, you can
+  // use (replace <desktop-id> with the RustDesk desktop file ID):
+  //   busctl --user call org.freedesktop.impl.portal.PermissionStore \
+  //   /org/freedesktop/impl/portal/PermissionStore org.freedesktop.impl.portal.PermissionStore \
+  //   DeletePermission sss "gnome" "shortcuts-inhibitor" "<desktop-id>"
+  // On a native install this is typically "rustdesk.desktop"; on Flatpak it is usually
+  // the exported desktop ID derived from the Flatpak app-id (e.g. "com.rustdesk.RustDesk.desktop").
+  //
+  // We may add it back in the future if needed.
+  final showResetInhibitorPermission = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (showResetInhibitorPermission) {
+      platformFFI.registerEventHandler(
+          _kClearShortcutsInhibitorEventKey, _kClearShortcutsInhibitorEventKey,
+          (evt) async {
+        if (!mounted) return;
+        if (evt['success'] == true) {
+          setState(() {});
+        } else {
+          _clearShortcutsInhibitorFailedMsg.value =
+              evt['msg'] as String? ?? 'Unknown error';
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    if (showResetInhibitorPermission) {
+      platformFFI.unregisterEventHandler(
+          _kClearShortcutsInhibitorEventKey, _kClearShortcutsInhibitorEventKey);
+    }
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2545,9 +2632,16 @@ class _WaylandCardState extends State<WaylandCard> {
       future: bind.mainHandleWaylandScreencastRestoreToken(
           key: restoreTokenKey, value: "get"),
       hasData: (restoreToken) {
+        final hasShortcutsPermission = showResetInhibitorPermission &&
+            bind.mainGetCommonSync(
+                    key: "has-gnome-shortcuts-inhibitor-permission") ==
+                "true";
+
         final children = [
           if (restoreToken.isNotEmpty)
             _buildClearScreenSelection(context, restoreToken),
+          if (hasShortcutsPermission)
+            _buildClearShortcutsInhibitorPermission(context),
         ];
         return Offstage(
           offstage: children.isEmpty,
@@ -2591,6 +2685,50 @@ class _WaylandCardState extends State<WaylandCard> {
             Theme.of(context).colorScheme.error.withOpacity(0.75)),
       ),
     );
+  }
+
+  Widget _buildClearShortcutsInhibitorPermission(BuildContext context) {
+    onConfirm() {
+      _clearShortcutsInhibitorFailedMsg.value = '';
+      bind.mainSetCommon(
+          key: "clear-gnome-shortcuts-inhibitor-permission", value: "");
+      gFFI.dialogManager.dismissAll();
+    }
+
+    showConfirmMsgBox() => msgBoxCommon(
+            gFFI.dialogManager,
+            'Confirmation',
+            Text(
+              translate('confirm-clear-shortcuts-inhibitor-permission-tip'),
+            ),
+            [
+              dialogButton('OK', onPressed: onConfirm),
+              dialogButton('Cancel',
+                  onPressed: () => gFFI.dialogManager.dismissAll())
+            ]);
+
+    return Column(children: [
+      Obx(
+        () => _clearShortcutsInhibitorFailedMsg.value.isEmpty
+            ? Offstage()
+            : Align(
+                alignment: Alignment.topLeft,
+                child: Text(_clearShortcutsInhibitorFailedMsg.value,
+                        style: DefaultTextStyle.of(context)
+                            .style
+                            .copyWith(color: Colors.red))
+                    .marginOnly(bottom: 10.0)),
+      ),
+      _Button(
+        'Reset keyboard shortcuts permission',
+        showConfirmMsgBox,
+        tip: 'clear-shortcuts-inhibitor-permission-tip',
+        style: ButtonStyle(
+          backgroundColor: MaterialStateProperty.all<Color>(
+              Theme.of(context).colorScheme.error.withOpacity(0.75)),
+        ),
+      ),
+    ]);
   }
 }
 

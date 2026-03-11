@@ -1101,6 +1101,10 @@ pub fn main_get_api_server() -> String {
     get_api_server()
 }
 
+pub fn main_resolve_avatar_url(avatar: String) -> SyncReturn<String> {
+    SyncReturn(resolve_avatar_url(avatar))
+}
+
 pub fn main_http_request(url: String, method: String, body: Option<String>, header: String) {
     http_request(url, method, body, header)
 }
@@ -2759,6 +2763,11 @@ pub fn main_get_common(key: String) -> String {
             None => "",
         }
         .to_string();
+    } else if key == "has-gnome-shortcuts-inhibitor-permission" {
+        #[cfg(target_os = "linux")]
+        return crate::platform::linux::has_gnome_shortcuts_inhibitor_permission().to_string();
+        #[cfg(not(target_os = "linux"))]
+        return false.to_string();
     } else {
         if key.starts_with("download-data-") {
             let id = key.replace("download-data-", "");
@@ -2771,10 +2780,13 @@ pub fn main_get_common(key: String) -> String {
         } else if key.starts_with("download-file-") {
             let _version = key.replace("download-file-", "");
             #[cfg(target_os = "windows")]
-            return match crate::platform::windows::is_msi_installed() {
-                Ok(true) => format!("rustdesk-{_version}-x86_64.msi"),
-                Ok(false) => format!("rustdesk-{_version}-x86_64.exe"),
-                Err(e) => {
+            return match (
+                crate::platform::windows::is_msi_installed(),
+                crate::common::is_custom_client(),
+            ) {
+                (Ok(true), false) => format!("rustdesk-{_version}-x86_64.msi"),
+                (Ok(true), true) | (Ok(false), _) => format!("rustdesk-{_version}-x86_64.exe"),
+                (Err(e), _) => {
                     log::error!("Failed to check if is msi: {}", e);
                     format!("error:update-failed-check-msi-tip")
                 }
@@ -2871,30 +2883,17 @@ pub fn main_set_common(_key: String, _value: String) {
                 if let Some(f) = new_version_file.to_str() {
                     // 1.4.0 does not support "--update"
                     // But we can assume that the new version supports it.
-                    #[cfg(target_os = "windows")]
-                    if f.ends_with(".exe") {
-                        if let Err(e) =
-                            crate::platform::run_exe_in_cur_session(f, vec!["--update"], false)
-                        {
-                            log::error!("Failed to run the update exe: {}", e);
-                        }
-                    } else if f.ends_with(".msi") {
-                        if let Err(e) = crate::platform::update_me_msi(f, false) {
-                            log::error!("Failed to run the update msi: {}", e);
-                        }
-                    } else {
-                        // unreachable!()
-                    }
-                    #[cfg(target_os = "macos")]
+
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
                     match crate::platform::update_to(f) {
                         Ok(_) => {
-                            log::info!("Update successfully!");
+                            log::info!("Update process is launched successfully!");
                         }
                         Err(e) => {
                             log::error!("Failed to update to new version, {}", e);
+                            fs::remove_file(f).ok();
                         }
                     }
-                    fs::remove_file(f).ok();
                 }
             }
         } else if _key == "extract-update-dmg" {
@@ -2919,6 +2918,29 @@ pub fn main_set_common(_key: String, _value: String) {
         crate::hbbs_http::downloader::remove(&_value);
     } else if _key == "cancel-downloader" {
         crate::hbbs_http::downloader::cancel(&_value);
+    }
+
+    #[cfg(target_os = "linux")]
+    if _key == "clear-gnome-shortcuts-inhibitor-permission" {
+        std::thread::spawn(move || {
+            let (success, msg) =
+                match crate::platform::linux::clear_gnome_shortcuts_inhibitor_permission() {
+                    Ok(_) => (true, "".to_owned()),
+                    Err(e) => (false, e.to_string()),
+                };
+            let data = HashMap::from([
+                (
+                    "name",
+                    serde_json::json!("clear-gnome-shortcuts-inhibitor-permission-res"),
+                ),
+                ("success", serde_json::json!(success)),
+                ("msg", serde_json::json!(msg)),
+            ]);
+            let _res = flutter::push_global_event(
+                flutter::APP_TYPE_MAIN,
+                serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
+            );
+        });
     }
 }
 
